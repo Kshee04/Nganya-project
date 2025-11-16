@@ -38,6 +38,7 @@ Booking status updates via Socket.IO
 
 Project Structure
 muhad/
+muhad/
 │
 ├─ nganya-trip-backend/     # Node.js backend
 │  ├─ models/              # Mongoose schemas
