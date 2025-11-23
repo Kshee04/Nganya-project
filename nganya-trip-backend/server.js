@@ -3,8 +3,8 @@ const express = require('express');
 const mongoose = require('mongoose');
 const cors = require('cors');
 const http = require('http');
+const { Server } = require('socket.io');
 
-const { setupSocket } = require('./socket');
 const Passenger = require('./models/Passenger');
 const Driver = require('./models/Driver');
 const Booking = require('./models/Booking');
@@ -13,19 +13,86 @@ const app = express();
 app.use(cors());
 app.use(express.json());
 
-const server = http.createServer(app);
-const io = setupSocket(server);
-
 // -------------------- MONGO --------------------
 mongoose.connect(process.env.MONGO_URI || 'mongodb://localhost:27017/nganya', {
     useNewUrlParser: true,
     useUnifiedTopology: true
 })
-.then(()=>console.log('MongoDB Connected'))
+.then(() => console.log('MongoDB Connected'))
 .catch(err => console.error(err));
 
-// -------------------- PASSENGER --------------------
-// (same as before)
+// -------------------- SERVER & SOCKET.IO --------------------
+const server = http.createServer(app);
+
+const io = new Server(server, {
+    cors: {
+        origin: "https://nganya-project-sable.vercel.app", // frontend URL
+        methods: ["GET","POST"],
+        credentials: true
+    },
+    transports: ["websocket", "polling"]
+});
+
+const onlineDrivers = new Map();
+
+io.on('connection', socket => {
+    console.log('Socket connected:', socket.id);
+
+    socket.on('joinDriver', driverId => {
+        socket.join(driverId.toString());
+        onlineDrivers.set(driverId.toString(), socket.id);
+
+        Driver.find({ isOnline:true, status:'approved' }).then(drivers => {
+            io.emit('driversOnlineList', drivers.map(d => ({
+                _id: d._id,
+                name: d.name,
+                vehicle: d.vehicle,
+                route: d.route,
+                capacity: d.capacity
+            })));
+        });
+    });
+
+    socket.on('joinPassenger', passengerId => {
+        socket.join(passengerId.toString());
+    });
+
+    socket.on('passengerGPS', data => {
+        if(data.driverId) socket.to(data.driverId.toString()).emit('driverGPSUpdate', { lat:data.lat, lng:data.lng });
+    });
+
+    socket.on('getOnlineDrivers', async () => {
+        try {
+            const drivers = await Driver.find({ isOnline:true, status:'approved' });
+            socket.emit('driversOnlineList', drivers.map(d => ({
+                _id: d._id,
+                name: d.name,
+                vehicle: d.vehicle,
+                route: d.route,
+                capacity: d.capacity
+            })));
+        } catch(err) {
+            console.error('Failed to fetch online drivers:', err);
+        }
+    });
+
+    socket.on('disconnect', () => {
+        for(const [driverId, sId] of onlineDrivers.entries()){
+            if(sId === socket.id) onlineDrivers.delete(driverId);
+        }
+        Driver.find({ isOnline:true, status:'approved' }).then(drivers => {
+            io.emit('driversOnlineList', drivers.map(d => ({
+                _id: d._id,
+                name: d.name,
+                vehicle: d.vehicle,
+                route: d.route,
+                capacity: d.capacity
+            })));
+        });
+    });
+});
+
+// -------------------- PASSENGER ROUTES --------------------
 app.post('/api/passengers/register', async (req,res)=>{
     const { name, phone, email, password } = req.body;
     try{
@@ -82,7 +149,7 @@ app.post('/api/passengers/bookings/request', async (req,res)=>{
     }
 });
 
-// -------------------- DRIVER --------------------
+// -------------------- DRIVER ROUTES --------------------
 app.post('/api/drivers/register', async (req,res)=>{
     const { name, phone, password } = req.body;
     try{
@@ -184,11 +251,7 @@ app.post('/api/drivers/bookings/accept', async (req,res)=>{
     }
 });
 
-// -------------------- ADMIN FIX --------------------
-
-// -------------------- ADMIN FIX --------------------
-
-// Get all drivers
+// -------------------- ADMIN ROUTES --------------------
 app.get('/api/drivers/all', async (req,res)=>{
     try{
         const drivers = await Driver.find();
@@ -199,7 +262,6 @@ app.get('/api/drivers/all', async (req,res)=>{
     }
 });
 
-// Approve driver
 app.post('/api/drivers/approve', async (req,res)=>{
     const { driverId } = req.body;
     if(!driverId) return res.status(400).json({ success:false, message:'Driver ID required' });
@@ -211,7 +273,6 @@ app.post('/api/drivers/approve', async (req,res)=>{
         driver.status = 'approved';
         await driver.save();
 
-        // Emit updated online drivers
         const driversOnline = await Driver.find({ isOnline:true, status:'approved' });
         io.emit('driversOnlineList', driversOnline.map(d=>({
             _id: d._id,
@@ -228,88 +289,24 @@ app.post('/api/drivers/approve', async (req,res)=>{
     }
 });
 
-// Reject driver - MOVED OUTSIDE OF APPROVE ROUTE
 app.post('/api/drivers/reject', async (req, res) => {
     const { driverId, reason } = req.body;
-
-    if (!driverId)
-        return res.status(400).json({ success: false, message: 'Driver ID required' });
+    if (!driverId) return res.status(400).json({ success:false, message: 'Driver ID required' });
 
     try {
         const driver = await Driver.findById(driverId);
-        if (!driver)
-            return res.status(404).json({ success: false, message: 'Driver not found' });
+        if (!driver) return res.status(404).json({ success:false, message:'Driver not found' });
 
         driver.status = 'rejected';
         driver.rejectReason = reason || "No reason provided";
         driver.isOnline = false;
         await driver.save();
 
-        res.json({ success: true, driver });
-    } catch (err) {
+        res.json({ success:true, driver });
+    } catch(err) {
         console.error(err);
-        res.status(500).json({ success: false, message: 'Failed to reject driver' });
+        res.status(500).json({ success:false, message:'Failed to reject driver' });
     }
-});
-
-// -------------------- SOCKET.IO --------------------
-const onlineDrivers = new Map();
-
-io.on('connection', socket=>{
-    console.log('Socket connected:', socket.id);
-
-    socket.on('joinDriver', driverId=>{
-        socket.join(driverId.toString());
-        onlineDrivers.set(driverId.toString(), socket.id);
-
-        Driver.find({ isOnline:true, status:'approved' }).then(drivers=>{
-            io.emit('driversOnlineList', drivers.map(d=>({
-                _id: d._id,
-                name: d.name,
-                vehicle: d.vehicle,
-                route: d.route,
-                capacity: d.capacity
-            })));
-        });
-    });
-
-    socket.on('joinPassenger', passengerId=>{
-        socket.join(passengerId.toString());
-    });
-
-    socket.on('passengerGPS', data=>{
-        if(data.driverId) socket.to(data.driverId.toString()).emit('driverGPSUpdate', { lat:data.lat, lng:data.lng });
-    });
-
-    socket.on('getOnlineDrivers', async ()=>{
-        try{
-            const drivers = await Driver.find({ isOnline:true, status:'approved' });
-            socket.emit('driversOnlineList', drivers.map(d=>({
-                _id: d._id,
-                name: d.name,
-                vehicle: d.vehicle,
-                route: d.route,
-                capacity: d.capacity
-            })));
-        }catch(err){
-            console.error('Failed to fetch online drivers:', err);
-        }
-    });
-
-    socket.on('disconnect', ()=>{
-        for(const [driverId, sId] of onlineDrivers.entries()){
-            if(sId === socket.id) onlineDrivers.delete(driverId);
-        }
-        Driver.find({ isOnline:true, status:'approved' }).then(drivers=>{
-            io.emit('driversOnlineList', drivers.map(d=>({
-                _id: d._id,
-                name: d.name,
-                vehicle: d.vehicle,
-                route: d.route,
-                capacity: d.capacity
-            })));
-        });
-    });
 });
 
 // -------------------- START SERVER --------------------
