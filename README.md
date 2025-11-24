@@ -70,11 +70,6 @@ npm install express mongoose cors dotenv socket.io
 
 Getting Started
 
-Clone the repo:
-
-git clone https://github.com/sesco001/Nganya-project.git
-cd muhad
-
 
 Install backend dependencies:
 
